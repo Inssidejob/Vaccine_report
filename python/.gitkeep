@@ -1,0 +1,320 @@
+"""
+clean_and_prepare.py
+Read Excel input files, clean columns, standardize country codes, compute missing coverage when possible,
+and write cleaned CSVs to ../data_cleaned/.
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import time
+
+# --- CONFIGURATION ---
+
+# Robust path detection:
+PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+
+# Define Data Directories
+RAW_DIR = os.path.join(PROJECT_ROOT, "data_raw")
+OUT_DIR = os.path.join(PROJECT_ROOT, "data_cleaned")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+FILES = {
+    "coverage": "coverage.xlsx",
+    "incidence": "incidence.xlsx",
+    "cases": "cases.xlsx",
+    "vaccine_intro": "vaccine_intro.xlsx",
+    "vaccine_schedule": "vaccine_schedule.xlsx"
+}
+
+
+# --- IO FUNCTIONS ---
+
+def read_excel_safe(path, sheet_name=0):
+    """Safely reads an Excel file."""
+    if not os.path.exists(path):
+        print(f"WARNING: File not found: {path}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+        if df.empty:
+            print(f"WARNING: File is empty: {path}")
+        return df
+    except Exception as e:
+        print(f"ERROR reading {path}: {e}")
+        return pd.DataFrame()
+
+
+# --- STANDARDIZATION HELPERS ---
+
+def standardize_cols(df):
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def standardize_headers_generic(df):
+    """Standardize common uppercase headers to Title Case."""
+    rename_map = {
+        'CODE': 'Code', 'code': 'Code', 'ISO_3_CODE': 'Code', 'ISO_3_Code': 'Code',
+        'YEAR': 'Year', 'year': 'Year',
+        'NAME': 'Name', 'name': 'Name',
+        'DISEASE': 'Disease', 'disease': 'Disease',
+        'ANTIGEN': 'Antigen', 'antigen': 'Antigen',
+        'VACCINE': 'Vaccine', 'vaccine': 'Vaccine',
+    }
+    for col in df.columns:
+        if col in rename_map:
+            df.rename(columns={col: rename_map[col]}, inplace=True)
+    return df
+
+
+def standardize_country_codes(df):
+    if 'Code' in df.columns:
+        df['Code'] = df['Code'].astype(str).str.upper().str.strip()
+    if 'Name' in df.columns:
+        df['Name'] = df['Name'].astype(str).str.title().str.strip()
+    return df
+
+
+# --- CLEANING FUNCTIONS ---
+
+def clean_coverage(df):
+    print("\n--- Processing Coverage Data ---")
+    if df.empty: return df
+
+    df = standardize_cols(df)
+    df = standardize_headers_generic(df)
+    df = standardize_country_codes(df)
+
+    rename_map = {
+        'coverage': 'Coverage', 'COVERAGE': 'Coverage',
+        'Value': 'Coverage', 'value': 'Coverage',
+        'Percent': 'Coverage', 'percentage': 'Coverage',
+        'TARGET_NUMBER': 'Target number', 'Target Number': 'Target number',
+        'DOSES': 'Doses', 'doses': 'Doses',
+        'ANTIGEN': 'Antigen'
+    }
+    for col in df.columns:
+        if col in rename_map:
+            df.rename(columns={col: rename_map[col]}, inplace=True)
+
+    if 'Coverage' not in df.columns:
+        print("WARNING: 'Coverage' column missing. Creating empty placeholder.")
+        df['Coverage'] = np.nan
+
+    # Safely convert Year (round first to handle 2020.0)
+    if 'Year' in df.columns:
+        df['Year'] = pd.to_numeric(df['Year'], errors='coerce').round().astype('Int64')
+
+    # Coverage is float (percentage)
+    df['Coverage'] = pd.to_numeric(df['Coverage'], errors='coerce')
+
+    # Safely convert Target number (round first to handle 100.5)
+    if 'Target number' in df.columns:
+        df['Target number'] = pd.to_numeric(df['Target number'], errors='coerce').round().astype('Int64')
+
+    # Handle Doses synonyms
+    for alt in ['Dodge', 'Dose', 'Number of doses']:
+        if alt in df.columns and 'Doses' not in df.columns:
+            df.rename(columns={alt: 'Doses'}, inplace=True)
+
+    if 'Doses' in df.columns:
+        df['Doses'] = pd.to_numeric(df['Doses'], errors='coerce').round().astype('Int64')
+
+    if 'Antigen' in df.columns:
+        df['Antigen'] = df['Antigen'].astype(str).str.upper().str.strip()
+
+    # Compute coverage where missing
+    if 'Doses' in df.columns and 'Target number' in df.columns:
+        mask = df['Coverage'].isna() & df['Doses'].notna() & df['Target number'].notna()
+        if mask.any():
+            print(f"Calculated coverage for {mask.sum()} rows based on Doses/Target.")
+            df.loc[mask, 'Coverage'] = (df.loc[mask, 'Doses'].astype(float) / df.loc[mask, 'Target number'].astype(
+                float)) * 100
+
+    if 'Code' in df.columns and 'Year' in df.columns:
+        df = df[df['Code'].notna() & df['Year'].notna()]
+
+    df = df.drop_duplicates()
+    return df
+
+
+def clean_incidence(df):
+    print("\n--- Processing Incidence Data ---")
+    if df.empty: return df
+
+    df = standardize_cols(df)
+    df = standardize_headers_generic(df)
+    df = standardize_country_codes(df)
+
+    rename_map = {
+        'INCIDENCE_RATE': 'Incidence rate', 'Incidence_Rate': 'Incidence rate',
+        'DENOMINATOR': 'Denominator'
+    }
+    for col in df.columns:
+        if col in rename_map:
+            df.rename(columns={col: rename_map[col]}, inplace=True)
+
+    if 'Year' in df.columns:
+        df['Year'] = pd.to_numeric(df['Year'], errors='coerce').round().astype('Int64')
+    if 'Incidence rate' in df.columns:
+        df['Incidence rate'] = pd.to_numeric(df['Incidence rate'], errors='coerce')
+    if 'Denominator' in df.columns:
+        df['Denominator'] = pd.to_numeric(df['Denominator'], errors='coerce').round().astype('Int64')
+    if 'Disease' in df.columns:
+        df['Disease'] = df['Disease'].astype(str).str.upper().str.strip()
+
+    if 'Code' in df.columns and 'Year' in df.columns:
+        df = df[df['Code'].notna() & df['Year'].notna()]
+
+    df = df.drop_duplicates()
+    return df
+
+
+def clean_cases(df):
+    print("\n--- Processing Cases Data ---")
+    if df.empty: return df
+
+    df = standardize_cols(df)
+    df = standardize_headers_generic(df)
+    df = standardize_country_codes(df)
+
+    rename_map = {
+        'CASES': 'Cases', 'Number of cases': 'Cases'
+    }
+    for col in df.columns:
+        if col in rename_map:
+            df.rename(columns={col: rename_map[col]}, inplace=True)
+
+    if 'Year' in df.columns:
+        df['Year'] = pd.to_numeric(df['Year'], errors='coerce').round().astype('Int64')
+    if 'Cases' in df.columns:
+        df['Cases'] = pd.to_numeric(df['Cases'], errors='coerce').fillna(0).round().astype('Int64')
+    if 'Disease' in df.columns:
+        df['Disease'] = df['Disease'].astype(str).str.upper().str.strip()
+
+    if 'Code' in df.columns and 'Year' in df.columns:
+        df = df[df['Code'].notna() & df['Year'].notna()]
+
+    df = df.drop_duplicates()
+    return df
+
+
+def clean_vaccine_intro(df):
+    print("\n--- Processing Vaccine Intro Data ---")
+    if df.empty: return df
+
+    df = standardize_cols(df)
+    df = standardize_headers_generic(df)
+    df = standardize_country_codes(df)
+
+    rename_map = {'INTRO': 'Intro', 'INTRODUCTION': 'Intro'}
+    for col in df.columns:
+        if col in rename_map:
+            df.rename(columns={col: rename_map[col]}, inplace=True)
+
+    if 'Year' in df.columns:
+        df['Year'] = pd.to_numeric(df['Year'], errors='coerce').round().astype('Int64')
+    if 'Intro' in df.columns:
+        df['Intro'] = pd.to_numeric(df['Intro'], errors='coerce').fillna(0).round().astype('Int64')
+
+    if 'Code' in df.columns and 'Year' in df.columns:
+        df = df[df['Code'].notna() & df['Year'].notna()]
+
+    df = df.drop_duplicates()
+    return df
+
+
+def clean_schedule(df):
+    print("\n--- Processing Schedule Data ---")
+    if df.empty: return df
+
+    df = standardize_cols(df)
+    df = standardize_headers_generic(df)
+    df = standardize_country_codes(df)
+
+    rename_map = {
+        'VACCINE_CODE': 'Vaccine code',
+        'VACCINE_DESCRIPTION': 'Vaccine description',
+        'SCHEDULE_ROUNDS': 'Schedule rounds',
+        'TARGET_POP': 'Target pop',
+        'AGE_ADMINISTERED': 'Age administered',
+        'GEOAREA': 'Geoarea'
+    }
+    for col in df.columns:
+        if col in rename_map:
+            df.rename(columns={col: rename_map[col]}, inplace=True)
+
+    if 'Year' in df.columns:
+        df['Year'] = pd.to_numeric(df['Year'], errors='coerce').round().astype('Int64')
+
+    for c in ['Vaccine code', 'Vaccine description', 'Schedule rounds', 'Target pop', 'Age administered', 'Geoarea']:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    if 'Code' in df.columns and 'Year' in df.columns:
+        df = df[df['Code'].notna() & df['Year'].notna()]
+
+    df = df.drop_duplicates()
+    return df
+
+
+# --- MAIN EXECUTION ---
+
+def main():
+    print(f"Script location: {os.path.abspath(__file__)}")
+    print(f"Looking for data in: {os.path.abspath(RAW_DIR)}")
+
+    if not os.path.exists(RAW_DIR):
+        print(f"ERROR: The folder '{RAW_DIR}' does not exist.")
+        return
+
+    # 1. Read files
+    start_time = time.time()
+
+    print("--> Reading coverage.xlsx (this may take time)...")
+    cov = read_excel_safe(os.path.join(RAW_DIR, FILES['coverage']))
+
+    print("--> Reading incidence.xlsx...")
+    inc = read_excel_safe(os.path.join(RAW_DIR, FILES['incidence']))
+
+    print("--> Reading cases.xlsx...")
+    cases = read_excel_safe(os.path.join(RAW_DIR, FILES['cases']))
+
+    print("--> Reading vaccine_intro.xlsx...")
+    intro = read_excel_safe(os.path.join(RAW_DIR, FILES['vaccine_intro']))
+
+    print("--> Reading vaccine_schedule.xlsx...")
+    sched = read_excel_safe(os.path.join(RAW_DIR, FILES['vaccine_schedule']))
+
+    elapsed = time.time() - start_time
+    print(f"All files loaded in {elapsed:.2f} seconds.")
+    print(f"Raw rows: coverage {len(cov)}, incidence {len(inc)}, cases {len(cases)}")
+
+    # 2. Cleaning
+    cov_clean = clean_coverage(cov)
+    inc_clean = clean_incidence(inc)
+    cases_clean = clean_cases(cases)
+    intro_clean = clean_vaccine_intro(intro)
+    sched_clean = clean_schedule(sched)
+
+    # 3. Save cleaned CSVs
+    print("\n--> Saving to CSV...")
+
+    def save_csv(df, filename):
+        path = os.path.join(OUT_DIR, filename)
+        df.to_csv(path, index=False)
+        print(f"Saved: {filename} ({len(df)} rows)")
+
+    save_csv(cov_clean, "coverage_clean.csv")
+    save_csv(inc_clean, "incidence_clean.csv")
+    save_csv(cases_clean, "cases_clean.csv")
+    save_csv(intro_clean, "vaccine_intro_clean.csv")
+    save_csv(sched_clean, "vaccine_schedule_clean.csv")
+
+    print(f"\nDONE! Cleaned files written to: {OUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
